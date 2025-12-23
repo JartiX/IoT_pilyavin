@@ -32,6 +32,23 @@ const unsigned long AUTO_START_TIMEOUT = 3000;
 enum Mode { MODE_AUTO, MODE_MANUAL, MODE_RAW };
 Mode currentMode = MODE_AUTO;
 
+// ==================== TIMER MANAGEMENT ====================
+volatile bool displayTimerActive = false;
+volatile unsigned int displayTimerTicks = 0;
+const unsigned int DISPLAY_HOLD_TICKS = 5;  // 5 × 100ms = 500ms
+
+volatile bool rxResetTimerActive = false;
+volatile unsigned int rxResetTimerTicks = 0;
+const unsigned int RX_RESET_TICKS = 20;  // 20 × 100ms = 2000ms
+
+volatile bool txCompleteTimerActive = false;
+volatile unsigned int txCompleteTimerTicks = 0;
+const unsigned int TX_COMPLETE_TICKS = 1;  // 1 × 100ms = 100ms
+
+volatile bool pendingReceiveInit = false;
+volatile bool pendingTxIdle = false;
+volatile bool pendingDisplayClear = false;
+
 // ==================== MORSE TABLE IN PROGMEM ====================
 const char morse_A[] PROGMEM = ".-";
 const char morse_B[] PROGMEM = "-...";
@@ -129,6 +146,60 @@ bool autoStarted = false;
 unsigned long autoLastReceiveTime = 0;
 char autoMessage[64];
 
+// ==================== TIMER INTERRUPT ====================
+ISR(TIMER1_COMPA_vect) {
+  // Display hold timer
+  if (displayTimerActive) {
+    displayTimerTicks++;
+    if (displayTimerTicks >= DISPLAY_HOLD_TICKS) {
+      displayTimerActive = false;
+      displayTimerTicks = 0;
+      pendingDisplayClear = true;
+    }
+  }
+  
+  // RX reset timer
+  if (rxResetTimerActive) {
+    rxResetTimerTicks++;
+    if (rxResetTimerTicks >= RX_RESET_TICKS) {
+      rxResetTimerActive = false;
+      rxResetTimerTicks = 0;
+      pendingReceiveInit = true;
+    }
+  }
+  
+  // TX complete timer
+  if (txCompleteTimerActive) {
+    txCompleteTimerTicks++;
+    if (txCompleteTimerTicks >= TX_COMPLETE_TICKS) {
+      txCompleteTimerActive = false;
+      txCompleteTimerTicks = 0;
+      pendingTxIdle = true;
+    }
+  }
+}
+
+// ==================== TIMER SETUP ====================
+void setupTimer1() {
+  // Stop timer
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+  
+  // Setup for 100ms interval (10 Hz)
+  // For 16MHz Arduino: (16000000 / (prescaler * Hz)) - 1
+  // prescaler = 256, Hz = 10
+  OCR1A = 6249;  // (16000000 / (256 * 10)) - 1
+  
+  // CTC mode
+  TCCR1B |= (1 << WGM12);
+  
+  // Prescaler 256
+  TCCR1B |= (1 << CS12);
+  
+  TIMSK1 |= (1 << OCIE1A);
+}
+
 // ==================== MORSE ENCODING/DECODING ====================
 void encodeToMorse(char c, char* output) {
   c = toupper(c);
@@ -166,6 +237,9 @@ void displayChar(char c) {
   digitalWrite(LATCH_PIN, LOW);
   shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, code);
   digitalWrite(LATCH_PIN, HIGH);
+  
+  displayTimerActive = true;
+  displayTimerTicks = 0;
 }
 
 void clearDisplay() {
@@ -334,7 +408,6 @@ void receiveUpdate() {
       char decoded = decodeFromMorse(currentMorseReceived);
       Serial.print(decoded);
       displayChar(decoded);
-      delay(500);
       currentMorseReceived[0] = '\0';
       
       if (silenceDuration >= WORD_GAP_MIN) {
@@ -489,6 +562,8 @@ void setup() {
   digitalWrite(LED_RX, LOW);
   clearDisplay();
   
+  setupTimer1();
+  
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), buttonISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(RX_PIN), rxISR, CHANGE);
   
@@ -505,6 +580,20 @@ void setup() {
 
 // ==================== MAIN LOOP ====================
 void loop() {
+  if (pendingDisplayClear) {
+    pendingDisplayClear = false;
+  }
+  
+  if (pendingReceiveInit) {
+    pendingReceiveInit = false;
+    receiveInit();
+  }
+  
+  if (pendingTxIdle) {
+    pendingTxIdle = false;
+    txState = TX_IDLE;
+  }
+  
   if (Serial.available()) {
     char cmd = Serial.read();
     
@@ -596,12 +685,16 @@ void loop() {
   }
   
   if (rxState == RX_COMPLETE || rxState == RX_ERROR) {
-    delay(2000);
-    receiveInit();
+    if (!rxResetTimerActive) {
+      rxResetTimerActive = true;
+      rxResetTimerTicks = 0;
+    }
   }
   
   if (txState == TX_COMPLETE) {
-    delay(100);
-    txState = TX_IDLE;
+    if (!txCompleteTimerActive) {
+      txCompleteTimerActive = true;
+      txCompleteTimerTicks = 0;
+    }
   }
 }
